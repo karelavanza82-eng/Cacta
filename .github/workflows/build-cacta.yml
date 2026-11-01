@@ -41,6 +41,16 @@ jobs:
           mkdir -p thirdparty
           cp -a "$SRC/thirdparty/talloc" thirdparty/ || true
 
+          # Perbaiki sisa nama package Agora yang tertinggal di zip
+          # (mis. SandboxDocumentsProvider.kt masih "package com.newoether.agora.sandbox")
+          grep -rlaE 'com\.newoether\.agora' app/src --include='*.kt' --include='*.java' --include='*.xml' \
+            | while read -r f; do
+                echo "fix: $f"
+                LC_ALL=C sed -i 's/com\.newoether\.agora/com.muhamadkarel.cacta/g' "$f"
+              done
+          LC_ALL=C sed -i 's/COLUMN_TITLE, "Agora"/COLUMN_TITLE, "Cacta"/' \
+            app/src/main/java/com/muhamadkarel/cacta/sandbox/SandboxDocumentsProvider.kt
+
           echo "--- verifikasi ---"
           grep -n 'namespace\|applicationId' app/build.gradle.kts | head
           grep -n 'app_name' app/src/main/res/values/strings.xml | head -2
@@ -91,3 +101,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload model app/build/outputs/apk/fdroid/release/*.apk --clobber
+          
