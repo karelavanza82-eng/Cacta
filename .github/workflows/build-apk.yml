@@ -1,0 +1,61 @@
+name: Build APK (simple)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # Folder thirdparty/llama.cpp dan thirdparty/proot kosong kalau repo
+      # diupload lewat web (submodule tidak ikut). Clone manual di sini.
+      - name: Fetch native sources
+        run: |
+          if [ -z "$(ls -A thirdparty/llama.cpp 2>/dev/null)" ]; then
+            rm -rf thirdparty/llama.cpp
+            git clone --depth 1 https://github.com/ggml-org/llama.cpp.git thirdparty/llama.cpp
+          fi
+          if [ -z "$(ls -A thirdparty/proot 2>/dev/null)" ]; then
+            rm -rf thirdparty/proot
+            git clone --depth 1 https://github.com/termux/proot.git thirdparty/proot
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: "platform-tools ndk;28.2.13676358"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build PRoot runtime
+        run: |
+          chmod +x ./build-proot.sh
+          ./build-proot.sh
+
+      # Tanpa keystore, APK otomatis ditandatangani debug key (tetap bisa diinstal).
+      - name: Build APK
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleFdroidRelease --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cacta-apk
+          path: app/build/outputs/apk/fdroid/release/*.apk
+
+      # Opsional: tempel APK ke rilis "model" yang sudah ada
+      - name: Attach APK to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload model app/build/outputs/apk/fdroid/release/*.apk --clobber
