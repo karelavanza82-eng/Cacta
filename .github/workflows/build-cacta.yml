@@ -1,0 +1,350 @@
+name: Build Cacta APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # Ambil Cacta-rebrand.zip dari rilis, lalu timpa kode Agora asli dengan isinya
+      - name: Apply Cacta rebrand over repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p /tmp/rebrand
+          gh release download model -p 'Cacta-rebrand.zip' -D /tmp/rebrand --clobber
+          unzip -q /tmp/rebrand/Cacta-rebrand.zip -d /tmp/rebrand/x
+          SRC=/tmp/rebrand/x
+          [ -d "$SRC/cacta" ] && SRC="$SRC/cacta"
+          ls "$SRC"
+
+          # hapus folder/berkas lama yang diganti oleh zip (kecuali .git, .github, thirdparty)
+          for item in $(ls -A "$SRC"); do
+            case "$item" in .git|.github|thirdparty) continue;; esac
+            rm -rf "./$item"
+          done
+          rm -rf app/src build-logic
+
+          # salin isi zip
+          for item in $(ls -A "$SRC"); do
+            case "$item" in .git|.github|thirdparty) continue;; esac
+            cp -a "$SRC/$item" "./$item"
+          done
+          # talloc ikut dari zip, llama.cpp & proot diambil di langkah berikutnya
+          mkdir -p thirdparty
+          cp -a "$SRC/thirdparty/talloc" thirdparty/ || true
+
+          # Perbaiki sisa nama package Agora yang tertinggal di zip
+          # (mis. SandboxDocumentsProvider.kt masih "package com.newoether.agora.sandbox")
+          grep -rlaE 'com\.newoether\.agora' app/src --include='*.kt' --include='*.java' --include='*.xml' \
+            | while read -r f; do
+                echo "fix: $f"
+                LC_ALL=C sed -i 's/com\.newoether\.agora/com.muhamadkarel.cacta/g' "$f"
+              done
+          LC_ALL=C sed -i 's/COLUMN_TITLE, "Agora"/COLUMN_TITLE, "Cacta"/' \
+            app/src/main/java/com/muhamadkarel/cacta/sandbox/SandboxDocumentsProvider.kt
+
+          echo "--- verifikasi ---"
+          grep -n 'namespace\|applicationId' app/build.gradle.kts | head
+          grep -n 'app_name' app/src/main/res/values/strings.xml | head -2
+
+      # Video onboarding bawaan masih berisi logo + teks "Agora" (tertanam di MP4).
+      # Buat ulang video 1 dan 2 dengan logo cakar + teks "Cacta".
+      - name: Generate Cacta onboarding videos
+        run: |
+          pip install --quiet pillow numpy
+          cat > /tmp/gen_videos.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """Generate Cacta onboarding videos (welcome_video_1 / _2, dark + light).
+
+          usage: gen_videos.py <repo_root> [--frames N] [--out DIR]
+          Needs: Pillow, numpy, ffmpeg.
+          """
+          import math, subprocess, sys, os
+          import numpy as np
+          from PIL import Image, ImageDraw, ImageFont, ImageChops
+
+          ROOT = sys.argv[1]
+          OUT = os.path.join(ROOT, "app/src/main/res/raw")
+          for i, a in enumerate(sys.argv):
+              if a == "--out":
+                  OUT = sys.argv[i + 1]
+          SIZE, FPS = 1024, 60
+
+          # ---------- assets ----------
+          logo_rgba = Image.open(os.path.join(ROOT, "app/src/main/assets/cacta_transparent.png")).convert("RGBA")
+          LOGO = logo_rgba.split()[3]
+          bbox = LOGO.getbbox()
+          LOGO = LOGO.crop(bbox)
+          side = max(LOGO.size)
+          sq = Image.new("L", (side, side), 0)
+          sq.paste(LOGO, ((side - LOGO.width) // 2, (side - LOGO.height) // 2))
+          LOGO = sq
+
+          FONT_PATH = os.path.join(ROOT, "app/src/main/res/font/mioutfit_variable.ttf")
+
+
+          def font(px, weight=700):
+              f = ImageFont.truetype(FONT_PATH, px)
+              try:
+                  f.set_variation_by_axes([weight])
+              except Exception:
+                  pass
+              return f
+
+
+          def ease_out_back(x, k=1.70158):
+              x = min(max(x, 0.0), 1.0)
+              return 1 + (k + 1) * (x - 1) ** 3 + k * (x - 1) ** 2
+
+
+          def ease_io(x):
+              x = min(max(x, 0.0), 1.0)
+              return 4 * x ** 3 if x < 0.5 else 1 - (-2 * x + 2) ** 3 / 2
+
+
+          def ease_out(x):
+              x = min(max(x, 0.0), 1.0)
+              return 1 - (1 - x) ** 3
+
+
+          def prog(t, a, b):
+              return min(max((t - a) / (b - a), 0.0), 1.0)
+
+
+          def new():
+              return Image.new("L", (SIZE, SIZE), 0)
+
+
+          def put(canvas, img, cx, cy, alpha=1.0):
+              """paste mask `img` centred at cx,cy, additive (lighter)."""
+              if img.width < 1 or img.height < 1 or alpha <= 0:
+                  return
+              if alpha < 1:
+                  img = img.point(lambda v: int(v * alpha))
+              layer = new()
+              layer.paste(img, (int(round(cx - img.width / 2)), int(round(cy - img.height / 2))))
+              canvas.paste(ImageChops.lighter(canvas, layer))
+
+
+          def logo_at(px):
+              px = max(int(px), 1)
+              return LOGO.resize((px, px), Image.LANCZOS)
+
+
+          def dot(canvas, cx, cy, r, alpha=1.0):
+              if r < 0.5:
+                  return
+              s = 4
+              d = Image.new("L", (int(2 * r * s) + 4, int(2 * r * s) + 4), 0)
+              ImageDraw.Draw(d).ellipse([2, 2, 2 * r * s + 2, 2 * r * s + 2], fill=255)
+              d = d.resize((max(int(d.width / s), 1), max(int(d.height / s), 1)), Image.LANCZOS)
+              put(canvas, d, cx, cy, alpha)
+
+
+          # ---------- text lockup ----------
+          TEXT = "Cacta"
+          FS = 195
+          F = font(FS)
+          tb = F.getbbox(TEXT)
+          TEXT_W, TEXT_H = tb[2] - tb[0], tb[3] - tb[1]
+          TEXT_IMG = Image.new("L", (TEXT_W + 8, TEXT_H + 8), 0)
+          ImageDraw.Draw(TEXT_IMG).text((4 - tb[0], 4 - tb[1]), TEXT, font=F, fill=255)
+
+          LOGO_FINAL = 225
+          GAP = 30
+          LOCKUP_W = LOGO_FINAL + GAP + TEXT_IMG.width
+          LOCKUP_LEFT = (SIZE - LOCKUP_W) / 2
+
+
+          def frame1(t):
+              c = new()
+              cx = cy = SIZE / 2
+              # 0-0.5 dot appears
+              if t < 0.55:
+                  dot(c, cx, cy, 14 * ease_out(prog(t, 0.0, 0.5)))
+              # 0.5-1.4 dot -> logo
+              elif t < 5.7:
+                  s = ease_out_back(prog(t, 0.5, 1.4))
+                  big = 340
+                  # 2.0-3.1 slide into lockup
+                  m = ease_io(prog(t, 2.0, 3.1))
+                  size = big + (LOGO_FINAL - big) * m
+                  lx_final = LOCKUP_LEFT + LOGO_FINAL / 2
+                  lx = cx + (lx_final - cx) * m
+                  sz = size * s
+                  a = min(1.0, prog(t, 0.5, 0.9) * 1.5)
+                  if t < 0.9:
+                      dot(c, cx, cy, 14 * (1 - prog(t, 0.55, 0.9)), 1.0)
+                  put(c, logo_at(sz), lx, cy, a)
+                  # text wipe-in
+                  w = ease_out(prog(t, 2.4, 3.3))
+                  if w > 0:
+                      cw = max(int(TEXT_IMG.width * w), 1)
+                      piece = TEXT_IMG.crop((0, 0, cw, TEXT_IMG.height))
+                      tx_left = LOCKUP_LEFT + LOGO_FINAL + GAP
+                      put(c, piece, tx_left + cw / 2, cy + 6, min(1.0, w * 1.6))
+              # 5.7-6.5 collapse to dot (loop-friendly)
+              if t >= 5.7:
+                  k = ease_io(prog(t, 5.7, 6.3))
+                  base = new()
+                  lx_final = LOCKUP_LEFT + LOGO_FINAL / 2
+                  put(base, logo_at(LOGO_FINAL * (1 - 0.9 * k)), lx_final + (SIZE / 2 - lx_final) * k, SIZE / 2, 1 - k)
+                  tx_left = LOCKUP_LEFT + LOGO_FINAL + GAP
+                  ti = TEXT_IMG.resize((max(int(TEXT_IMG.width * (1 - 0.5 * k)), 1), max(int(TEXT_IMG.height * (1 - 0.5 * k)), 1)))
+                  put(base, ti, tx_left + TEXT_IMG.width / 2 + (SIZE / 2 - tx_left - TEXT_IMG.width / 2) * k, SIZE / 2 + 6, 1 - k)
+                  c = base
+                  dot(c, SIZE / 2, SIZE / 2, 14 * ease_out(prog(t, 6.0, 6.5)))
+              return c
+
+
+          # ---------- video 2 : "bring your own key" - logo + provider bubbles ----------
+          def bubble(canvas, cx, cy, r, kind, alpha=1.0):
+              s = 4
+              n = int(2 * r * s) + 8
+              im = Image.new("L", (n, n), 0)
+              d = ImageDraw.Draw(im)
+              c = n / 2
+              R = r * s
+              d.ellipse([c - R, c - R, c + R, c + R], fill=255)
+              ic = 0  # carve icon out in black
+              if kind == "spark":
+                  pts = []
+                  for i in range(8):
+                      ang = math.pi / 4 * i - math.pi / 2
+                      rr = R * (0.62 if i % 2 == 0 else 0.16)
+                      pts.append((c + rr * math.cos(ang), c + rr * math.sin(ang)))
+                  d.polygon(pts, fill=ic)
+              elif kind == "burst":
+                  for i in range(8):
+                      ang = math.pi / 8 * i * 2
+                      x, y = math.cos(ang), math.sin(ang)
+                      d.line([c - x * R * .55, c - y * R * .55, c + x * R * .55, c + y * R * .55], fill=ic, width=int(R * .14))
+              else:  # knot: three rounded petals
+                  for i in range(3):
+                      ang = 2 * math.pi / 3 * i - math.pi / 2
+                      ox, oy = c + R * .26 * math.cos(ang), c + R * .26 * math.sin(ang)
+                      rr = R * .3
+                      d.ellipse([ox - rr, oy - rr, ox + rr, oy + rr], outline=ic, width=int(R * .12))
+              im = im.resize((max(int(n / s), 1), max(int(n / s), 1)), Image.LANCZOS)
+              put(canvas, im, cx, cy, alpha)
+
+
+          BUBBLES = [("spark", -250, -230, 74, 0.9), ("burst", 270, -250, 64, 1.1), ("knot", 300, 40, 70, 1.3)]
+
+
+          def frame2(t):
+              c = new()
+              cx = cy = SIZE / 2
+              if t < 0.5:
+                  dot(c, cx, cy, 14 * ease_out(prog(t, 0, 0.5)))
+                  return c
+              if t >= 5.8:
+                  k = ease_io(prog(t, 5.8, 6.3))
+                  put(c, logo_at(360 * (1 - 0.95 * k)), cx, cy + 40 * (1 - k), 1 - k)
+                  dot(c, cx, cy, 14 * ease_out(prog(t, 6.0, 6.5)))
+                  return c
+              s = ease_out_back(prog(t, 0.5, 1.4))
+              if t < 0.9:
+                  dot(c, cx, cy, 14 * (1 - prog(t, 0.55, 0.9)))
+              put(c, logo_at(360 * s), cx, cy + 40, min(1.0, prog(t, 0.5, 0.9) * 1.5))
+              for i, (kind, dx, dy, r, ph) in enumerate(BUBBLES):
+                  st = 1.5 + 0.35 * i
+                  e = ease_out_back(prog(t, st, st + 0.7))
+                  if e <= 0:
+                      continue
+                  bob = math.sin((t - st) * 2 * math.pi / 3.0 + ph) * 14
+                  bubble(c, cx + dx * 0.9, cy + dy * 0.9 + bob + 40, r * e, kind, min(1.0, e))
+              return c
+
+
+          # ---------- encode ----------
+          def render(fn, duration, name_dark, name_light, frames_limit=None):
+              n = int(duration * FPS)
+              if frames_limit:
+                  n = min(n, frames_limit)
+              os.makedirs(OUT, exist_ok=True)
+              cmd = [
+                  "ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "gray",
+                  "-s", f"{SIZE}x{SIZE}", "-r", str(FPS), "-i", "-",
+                  "-filter_complex",
+                  "[0:v]split[a][b];[a]scale=in_range=full:out_range=tv,format=yuv420p[d];"
+                  "[b]negate,scale=in_range=full:out_range=tv,format=yuv420p[l]",
+                  "-map", "[d]", "-c:v", "libx264", "-crf", "20", "-preset", "veryfast", "-movflags", "+faststart",
+                  os.path.join(OUT, name_dark),
+                  "-map", "[l]", "-c:v", "libx264", "-crf", "20", "-preset", "veryfast", "-movflags", "+faststart",
+                  os.path.join(OUT, name_light),
+              ]
+              p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+              for i in range(n):
+                  p.stdin.write(fn(i / FPS).tobytes())
+              p.stdin.close()
+              if p.wait() != 0:
+                  raise SystemExit("ffmpeg failed")
+              print("wrote", name_dark, name_light, n, "frames")
+
+
+          if __name__ == "__main__":
+              lim = None
+              for i, a in enumerate(sys.argv):
+                  if a == "--frames":
+                      lim = int(sys.argv[i + 1])
+              render(frame1, 6.5, "welcome_video_1.mp4", "welcome_video_1_light.mp4", lim)
+              render(frame2, 6.5, "welcome_video_2.mp4", "welcome_video_2_light.mp4", lim)
+          PYEOF
+          python3 -I /tmp/gen_videos.py "$PWD"
+          ls -la app/src/main/res/raw/welcome_video_*.mp4
+
+      # Versi harus PERSIS sama dengan yang dipakai kode (bukan versi terbaru),
+      # kalau tidak kompilasi C++ gagal karena API llama.cpp berubah.
+      - name: Fetch native sources (pinned)
+        run: |
+          fetch_at() { # dir url sha
+            rm -rf "$1"; mkdir -p "$1"
+            git -C "$1" init -q
+            git -C "$1" remote add origin "$2"
+            git -C "$1" fetch --depth 1 origin "$3"
+            git -C "$1" checkout -q FETCH_HEAD
+          }
+          fetch_at thirdparty/llama.cpp https://github.com/ggml-org/llama.cpp.git 00d56b11c3477b99bc18562dc1d1834f0d961778
+          fetch_at thirdparty/proot https://github.com/termux/proot.git a7147b50d708567dbf884d21e0f0c8698bba0d10
+          git -C thirdparty/llama.cpp log -1 --format='llama.cpp %h'
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: "platform-tools ndk;28.2.13676358"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build PRoot runtime
+        run: |
+          chmod +x ./build-proot.sh
+          ./build-proot.sh
+
+      - name: Build APK
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleFdroidRelease --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cacta-apk
+          path: app/build/outputs/apk/fdroid/release/*.apk
+
+      - name: Attach APK to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload model app/build/outputs/apk/fdroid/release/*.apk --clobber
