@@ -348,4 +348,3 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload model app/build/outputs/apk/fdroid/release/*.apk --clobber
-          
