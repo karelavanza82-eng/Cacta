@@ -1,0 +1,93 @@
+name: Build Cacta APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # Ambil Cacta-rebrand.zip dari rilis, lalu timpa kode Agora asli dengan isinya
+      - name: Apply Cacta rebrand over repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p /tmp/rebrand
+          gh release download model -p 'Cacta-rebrand.zip' -D /tmp/rebrand --clobber
+          unzip -q /tmp/rebrand/Cacta-rebrand.zip -d /tmp/rebrand/x
+          SRC=/tmp/rebrand/x
+          [ -d "$SRC/cacta" ] && SRC="$SRC/cacta"
+          ls "$SRC"
+
+          # hapus folder/berkas lama yang diganti oleh zip (kecuali .git, .github, thirdparty)
+          for item in $(ls -A "$SRC"); do
+            case "$item" in .git|.github|thirdparty) continue;; esac
+            rm -rf "./$item"
+          done
+          rm -rf app/src build-logic
+
+          # salin isi zip
+          for item in $(ls -A "$SRC"); do
+            case "$item" in .git|.github|thirdparty) continue;; esac
+            cp -a "$SRC/$item" "./$item"
+          done
+          # talloc ikut dari zip, llama.cpp & proot diambil di langkah berikutnya
+          mkdir -p thirdparty
+          cp -a "$SRC/thirdparty/talloc" thirdparty/ || true
+
+          echo "--- verifikasi ---"
+          grep -n 'namespace\|applicationId' app/build.gradle.kts | head
+          grep -n 'app_name' app/src/main/res/values/strings.xml | head -2
+
+      # Versi harus PERSIS sama dengan yang dipakai kode (bukan versi terbaru),
+      # kalau tidak kompilasi C++ gagal karena API llama.cpp berubah.
+      - name: Fetch native sources (pinned)
+        run: |
+          fetch_at() { # dir url sha
+            rm -rf "$1"; mkdir -p "$1"
+            git -C "$1" init -q
+            git -C "$1" remote add origin "$2"
+            git -C "$1" fetch --depth 1 origin "$3"
+            git -C "$1" checkout -q FETCH_HEAD
+          }
+          fetch_at thirdparty/llama.cpp https://github.com/ggml-org/llama.cpp.git 00d56b11c3477b99bc18562dc1d1834f0d961778
+          fetch_at thirdparty/proot https://github.com/termux/proot.git a7147b50d708567dbf884d21e0f0c8698bba0d10
+          git -C thirdparty/llama.cpp log -1 --format='llama.cpp %h'
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: "platform-tools ndk;28.2.13676358"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build PRoot runtime
+        run: |
+          chmod +x ./build-proot.sh
+          ./build-proot.sh
+
+      - name: Build APK
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleFdroidRelease --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cacta-apk
+          path: app/build/outputs/apk/fdroid/release/*.apk
+
+      - name: Attach APK to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload model app/build/outputs/apk/fdroid/release/*.apk --clobber
