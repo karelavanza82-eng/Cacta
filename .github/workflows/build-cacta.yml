@@ -59,7 +59,7 @@ jobs:
       # Buat ulang video 1 dan 2 dengan logo cakar + teks "Cacta".
       - name: Generate Cacta onboarding videos
         run: |
-          pip install --quiet pillow numpy
+          python3 -m pip install --quiet pillow numpy
           cat > /tmp/gen_videos.py <<'PYEOF'
           #!/usr/bin/env python3
           """Generate Cacta onboarding videos (welcome_video_1 / _2, dark + light).
@@ -299,7 +299,7 @@ jobs:
               render(frame1, 6.5, "welcome_video_1.mp4", "welcome_video_1_light.mp4", lim)
               render(frame2, 6.5, "welcome_video_2.mp4", "welcome_video_2_light.mp4", lim)
           PYEOF
-          python3 -I /tmp/gen_videos.py "$PWD"
+          python3 /tmp/gen_videos.py "$PWD"
           ls -la app/src/main/res/raw/welcome_video_*.mp4
 
       # Versi harus PERSIS sama dengan yang dipakai kode (bukan versi terbaru),
@@ -348,3 +348,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload model app/build/outputs/apk/fdroid/release/*.apk --clobber
+          
