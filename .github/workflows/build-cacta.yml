@@ -59,6 +59,8 @@ jobs:
       # Buat ulang video 1 dan 2 dengan logo cakar + teks "Cacta".
       - name: Generate Cacta onboarding videos
         run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          ffmpeg -hide_banner -version | head -1
           python3 -m pip install --quiet pillow numpy
           cat > /tmp/gen_videos.py <<'PYEOF'
           #!/usr/bin/env python3
@@ -348,3 +350,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload model app/build/outputs/apk/fdroid/release/*.apk --clobber
+          
